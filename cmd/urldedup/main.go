@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,19 +33,28 @@ var (
 
 var susParams = initSusParams()
 
+// URLPattern represents a regex pattern along with example URLs.
 type URLPattern struct {
 	Regex    string
 	Examples []string
 }
 
-type URLResult struct {
-	url    string
-	status int
-	valid  bool
+type parsedURL struct {
+	original string
+	parsed   *url.URL
 }
 
+type urlInfo struct {
+	original     string
+	pathSegments []string
+	queryKeys    []string
+}
+
+// httpClient is shared among all validations.
+var httpClient *http.Client
+
 func main() {
-	// Define flags
+	// Define flags.
 	fileFlag := flag.String("f", "", "Path to the file containing URLs")
 	ignoreFlag := flag.String("ignore", "", "Comma-separated list of file extensions to ignore")
 	verboseFlag := flag.Bool("v", false, "Show verbose output with regex patterns")
@@ -51,6 +63,7 @@ func main() {
 	burpFlag := flag.String("out-burp", "BURP_URLs_with_params.txt", "Output file for other URLs")
 	threads := flag.Int("t", 10, "Number of concurrent threads")
 	timeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout")
+	validateFlag := flag.Bool("validate", true, "Perform HTTP URL validation (default true)")
 	flag.Parse()
 
 	if *fileFlag == "" {
@@ -58,31 +71,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup output files
+	// Setup logging.
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Setup output files.
 	burpGapFile, err := os.Create(*burpGapFlag)
 	if err != nil {
-		fmt.Printf("Error creating BURP GAP file: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Error creating BURP GAP file: %v", err)
 	}
 	defer burpGapFile.Close()
 
 	burpFile, err := os.Create(*burpFlag)
 	if err != nil {
-		fmt.Printf("Error creating BURP file: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Error creating BURP file: %v", err)
 	}
 	defer burpFile.Close()
 
+	// Process ignore extensions.
 	ignoreExts := processIgnoreFlag(*ignoreFlag)
 
+	// Read URLs from file.
 	urls, err := readURLs(*fileFlag, ignoreExts)
 	if err != nil {
-		fmt.Printf("Error reading file: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Error reading file: %v", err)
 	}
 
+	// Group URLs by path segment count.
 	pathGroups := make(map[int][]urlInfo)
-
 	for _, u := range urls {
 		segments := splitPath(u.parsed.Path)
 		pathLength := len(segments)
@@ -94,76 +109,17 @@ func main() {
 		})
 	}
 
+	// Generate regex patterns from the URL groups.
 	var patterns []URLPattern
-
-	for pathLen, group := range pathGroups {
+	for _, group := range pathGroups {
 		if len(group) == 0 {
 			continue
 		}
-
-		segmentsCount := pathLen
-		dynamicSegments := make([]bool, segmentsCount)
-
-		for i := 0; i < segmentsCount; i++ {
-			firstVal := group[0].pathSegments[i]
-			for _, info := range group {
-				if info.pathSegments[i] != firstVal {
-					dynamicSegments[i] = true
-					break
-				}
-			}
-		}
-
-		pathPatternParts := make([]string, segmentsCount)
-		for i := 0; i < segmentsCount; i++ {
-			if dynamicSegments[i] {
-				pathPatternParts[i] = `[^/]+`
-			} else {
-				pathPatternParts[i] = regexpEscape(group[0].pathSegments[i])
-			}
-		}
-
-		pathPattern := "^/" + strings.Join(pathPatternParts, "/")
-
-		queryGroups := make(map[string][]string)
-		for _, info := range group {
-			queryKey := strings.Join(info.queryKeys, "&")
-			queryGroups[queryKey] = append(queryGroups[queryKey], info.original)
-		}
-
-		for qKeys, examples := range queryGroups {
-			var queryPattern string
-			if qKeys != "" {
-				keys := strings.Split(qKeys, "&")
-				queryParts := make([]string, len(keys))
-				for i, k := range keys {
-					queryParts[i] = regexpEscape(k) + `=([^&]*)`
-				}
-				queryPattern = `\?` + strings.Join(queryParts, "&")
-			}
-
-			fullRegex := pathPattern
-			if queryPattern != "" {
-				fullRegex += queryPattern
-			}
-
-			maxExamples := *examplesFlag
-			if maxExamples < 1 {
-				maxExamples = 1
-			}
-			if len(examples) < maxExamples {
-				maxExamples = len(examples)
-			}
-			patternExamples := examples[:maxExamples]
-
-			patterns = append(patterns, URLPattern{
-				Regex:    fullRegex,
-				Examples: patternExamples,
-			})
-		}
+		groupPatterns := generateRegexPatterns(group, *examplesFlag)
+		patterns = append(patterns, groupPatterns...)
 	}
 
-	// Step 1: Gather all unique URLs from the pattern examples.
+	// Gather all unique URLs from the pattern examples.
 	uniqueURLsMap := make(map[string]bool)
 	for _, pattern := range patterns {
 		for _, ex := range pattern.Examples {
@@ -175,10 +131,25 @@ func main() {
 		uniqueURLs = append(uniqueURLs, urlStr)
 	}
 
-	// Step 2: Concurrently validate all unique URLs.
-	validityResults := validateURLs(uniqueURLs, *threads, *timeout)
+	// Setup the HTTP client with the specified timeout.
+	httpClient = &http.Client{
+		Timeout: *timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
-	// Step 3: Process each pattern and use the precomputed validity.
+	// Validate URLs if the -validate flag is set; otherwise, assume all URLs are valid.
+	validityResults := make(map[string]bool)
+	if *validateFlag {
+		validityResults = validateURLs(uniqueURLs, *threads, *timeout)
+	} else {
+		for _, u := range uniqueURLs {
+			validityResults[u] = true
+		}
+	}
+
+	// Process each pattern and write results based on suspicious parameters.
 	processedURLs := make(map[string]bool)
 	for _, pattern := range patterns {
 		if *verboseFlag {
@@ -186,7 +157,7 @@ func main() {
 			fmt.Println("Examples:")
 		}
 		for _, ex := range pattern.Examples {
-			// Deduplicate within the loop.
+			// Deduplicate.
 			if processedURLs[ex] {
 				continue
 			}
@@ -203,17 +174,21 @@ func main() {
 			// Parse URL for further processing.
 			parsed, err := url.Parse(ex)
 			if err != nil {
-				continue // Skip invalid URLs
+				continue // Skip invalid URLs.
 			}
 
-			// Check for suspicious parameters
+			// Check for suspicious parameters.
 			if hasSuspiciousParams(parsed.Query()) {
-				burpGapFile.WriteString(ex + "\n")
+				if _, err := burpGapFile.WriteString(ex + "\n"); err != nil {
+					log.Printf("Failed to write to burp gap file for URL %s: %v", ex, err)
+				}
 				if *verboseFlag {
 					fmt.Println("  SUS:", ex)
 				}
 			} else {
-				burpFile.WriteString(ex + "\n")
+				if _, err := burpFile.WriteString(ex + "\n"); err != nil {
+					log.Printf("Failed to write to burp file for URL %s: %v", ex, err)
+				}
 				if *verboseFlag {
 					fmt.Println("  OK:", ex)
 				}
@@ -225,62 +200,161 @@ func main() {
 	}
 }
 
-// isURLValid checks if a URL returns 200 or 302 without following redirects.
-// It now accepts a timeout parameter.
-func isURLValid(urlStr string, timeout time.Duration) bool {
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+// generateRegexPatterns creates unique regex patterns for a group of URL info.
+// It ensures that the same regex (pattern) is output only once, and if multiple
+// URLs produce the same pattern, their examples are merged (with duplicates removed).
+func generateRegexPatterns(group []urlInfo, examplesFlag int) []URLPattern {
+	segmentsCount := len(group[0].pathSegments)
+	dynamicSegments := make([]bool, segmentsCount)
+
+	// Determine which segments are dynamic.
+	for i := 0; i < segmentsCount; i++ {
+		firstVal := group[0].pathSegments[i]
+		for _, info := range group {
+			if info.pathSegments[i] != firstVal {
+				dynamicSegments[i] = true
+				break
+			}
+		}
 	}
 
-	resp, err := client.Get(urlStr)
+	pathPatternParts := make([]string, segmentsCount)
+	for i := 0; i < segmentsCount; i++ {
+		if dynamicSegments[i] {
+			pathPatternParts[i] = `[^/]+`
+		} else {
+			pathPatternParts[i] = regexpEscape(group[0].pathSegments[i])
+		}
+	}
+	pathPattern := "^/" + strings.Join(pathPatternParts, "/")
+
+	// Use a map to ensure uniqueness by regex.
+	patternMap := make(map[string]*URLPattern)
+
+	// Group by query keys (joined by "&").
+	queryGroups := make(map[string][]string)
+	for _, info := range group {
+		queryKey := strings.Join(info.queryKeys, "&")
+		queryGroups[queryKey] = append(queryGroups[queryKey], info.original)
+	}
+
+	for qKeys, examples := range queryGroups {
+		var queryPattern string
+		if qKeys != "" {
+			keys := strings.Split(qKeys, "&")
+			queryParts := make([]string, len(keys))
+			for i, k := range keys {
+				queryParts[i] = regexpEscape(k) + `=([^&]*)`
+			}
+			queryPattern = `\?` + strings.Join(queryParts, "&")
+		}
+
+		fullRegex := pathPattern
+		if queryPattern != "" {
+			fullRegex += queryPattern
+		}
+
+		// Remove duplicate examples.
+		uniqueExamples := make([]string, 0)
+		exampleSet := make(map[string]bool)
+		for _, ex := range examples {
+			if !exampleSet[ex] {
+				uniqueExamples = append(uniqueExamples, ex)
+				exampleSet[ex] = true
+			}
+		}
+
+		// Limit the number of examples.
+		maxExamples := examplesFlag
+		if maxExamples < 1 {
+			maxExamples = 1
+		}
+		if len(uniqueExamples) > maxExamples {
+			uniqueExamples = uniqueExamples[:maxExamples]
+		}
+
+		// Merge examples if the same regex pattern exists.
+		if existing, ok := patternMap[fullRegex]; ok {
+			for _, ex := range uniqueExamples {
+				if !contains(existing.Examples, ex) {
+					existing.Examples = append(existing.Examples, ex)
+				}
+			}
+		} else {
+			patternMap[fullRegex] = &URLPattern{
+				Regex:    fullRegex,
+				Examples: uniqueExamples,
+			}
+		}
+	}
+
+	// Convert map to slice.
+	patterns := make([]URLPattern, 0, len(patternMap))
+	for _, p := range patternMap {
+		patterns = append(patterns, *p)
+	}
+	return patterns
+}
+
+// contains checks if a slice of strings contains the given string.
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// isURLValidWithCtx checks if a URL returns 200 or 302 without following redirects, using the provided context.
+func isURLValidWithCtx(ctx context.Context, urlStr string) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
-
 	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound
 }
 
 // validateURLs concurrently validates URLs using the specified number of threads and timeout.
 func validateURLs(urls []string, threadCount int, timeout time.Duration) map[string]bool {
-	type job struct {
-		url string
-		idx int
-	}
-
 	results := make(map[string]bool)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	jobChan := make(chan job, len(urls))
+	jobChan := make(chan string, len(urls))
+	baseCtx := context.Background()
 
-	// Start workers
+	// Launch worker goroutines.
 	for i := 0; i < threadCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobChan {
-				valid := isURLValid(j.url, timeout)
+			for urlStr := range jobChan {
+				ctx, cancel := context.WithTimeout(baseCtx, timeout)
+				valid := isURLValidWithCtx(ctx, urlStr)
+				cancel()
 				mu.Lock()
-				results[j.url] = valid
+				results[urlStr] = valid
 				mu.Unlock()
 			}
 		}()
 	}
 
-	// Send jobs
-	for idx, u := range urls {
-		jobChan <- job{url: u, idx: idx}
+	// Enqueue jobs.
+	for _, u := range urls {
+		jobChan <- u
 	}
 	close(jobChan)
-
 	wg.Wait()
 	return results
 }
 
+// hasSuspiciousParams returns true if any query parameter matches a known suspicious parameter.
 func hasSuspiciousParams(query url.Values) bool {
 	for param := range query {
 		if susParams[strings.ToLower(param)] {
@@ -296,6 +370,7 @@ func addParams(m map[string]bool, params []string) {
 	}
 }
 
+// initSusParams initializes a map of suspicious parameters.
 func initSusParams() map[string]bool {
 	params := make(map[string]bool)
 	addParams(params, SUS_CMDI)
@@ -311,6 +386,7 @@ func initSusParams() map[string]bool {
 	return params
 }
 
+// processIgnoreFlag processes the ignore flag and returns a set of file extensions to ignore.
 func processIgnoreFlag(ignore string) map[string]bool {
 	ignoreExts := make(map[string]bool)
 	if ignore == "" {
@@ -326,47 +402,44 @@ func processIgnoreFlag(ignore string) map[string]bool {
 	return ignoreExts
 }
 
+// readURLs reads URLs from a file using a buffered scanner and filters out ignored extensions.
 func readURLs(filename string, ignoreExts map[string]bool) ([]parsedURL, error) {
-	content, err := os.ReadFile(filename)
+	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(string(content), "\n")
+	defer file.Close()
+
 	var urls []parsedURL
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(scanner.Text())
 		if trimmed == "" {
 			continue
 		}
 		parsed, err := url.Parse(trimmed)
 		if err != nil {
-			return nil, fmt.Errorf("invalid URL %q: %v", trimmed, err)
-		}
-
-		// Enhanced file extension detection
-		cleanPath := strings.TrimSuffix(parsed.Path, "/")
-		base := path.Base(cleanPath)
-		ext := path.Ext(base)
-		if ext != "" {
-			ext = strings.TrimPrefix(ext, ".")
-		}
-		ext = strings.ToLower(ext)
-
-		if _, ok := ignoreExts[ext]; ok {
+			// Skip invalid URLs.
 			continue
 		}
-
-		urls = append(urls, parsedURL{
-			original: trimmed,
-			parsed:   parsed,
-		})
+		cleanPath := strings.TrimSuffix(parsed.Path, "/")
+		base := path.Base(cleanPath)
+		ext := strings.ToLower(strings.TrimPrefix(path.Ext(base), "."))
+		if ignoreExts[ext] {
+			continue
+		}
+		urls = append(urls, parsedURL{original: trimmed, parsed: parsed})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return urls, nil
 }
 
-func splitPath(path string) []string {
+// splitPath splits a URL path into non-empty segments.
+func splitPath(p string) []string {
 	var segments []string
-	for _, s := range strings.Split(path, "/") {
+	for _, s := range strings.Split(p, "/") {
 		if s != "" {
 			segments = append(segments, s)
 		}
@@ -374,6 +447,7 @@ func splitPath(path string) []string {
 	return segments
 }
 
+// sortedQueryKeys returns the sorted keys of a URL query.
 func sortedQueryKeys(query url.Values) []string {
 	keys := make([]string, 0, len(query))
 	for k := range query {
@@ -383,17 +457,7 @@ func sortedQueryKeys(query url.Values) []string {
 	return keys
 }
 
+// regexpEscape escapes a string for use in a regular expression.
 func regexpEscape(s string) string {
 	return strings.ReplaceAll(regexp.QuoteMeta(s), "/", `\/`)
-}
-
-type parsedURL struct {
-	original string
-	parsed   *url.URL
-}
-
-type urlInfo struct {
-	original     string
-	pathSegments []string
-	queryKeys    []string
 }
