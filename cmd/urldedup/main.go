@@ -115,100 +115,8 @@ func main() {
 		if len(group) == 0 {
 			continue
 		}
-<<<<<<< HEAD
 		groupPatterns := generateRegexPatterns(group, *examplesFlag)
 		patterns = append(patterns, groupPatterns...)
-=======
-
-		segmentsCount := pathLen
-		dynamicSegments := make([]bool, segmentsCount)
-
-		for i := 0; i < segmentsCount; i++ {
-			firstVal := group[0].pathSegments[i]
-			for _, info := range group {
-				if info.pathSegments[i] != firstVal {
-					dynamicSegments[i] = true
-					break
-				}
-			}
-		}
-
-		pathPatternParts := make([]string, segmentsCount)
-		for i := 0; i < segmentsCount; i++ {
-			if dynamicSegments[i] {
-				pathPatternParts[i] = `[^/]+`
-			} else {
-				pathPatternParts[i] = regexpEscape(group[0].pathSegments[i])
-			}
-		}
-
-		pathPattern := "^/" + strings.Join(pathPatternParts, "/")
-
-		queryGroups := make(map[string][]string)
-		for _, info := range group {
-			queryKey := strings.Join(info.queryKeys, "&")
-			queryGroups[queryKey] = append(queryGroups[queryKey], info.original)
-		}
-
-		// Process queryGroups to remove subsets
-		var qkList []string
-		var qkSlices [][]string
-		for qk := range queryGroups {
-			qkList = append(qkList, qk)
-			qkSlices = append(qkSlices, strings.Split(qk, "&"))
-		}
-
-		isRedundant := make([]bool, len(qkList))
-		for i := 0; i < len(qkList); i++ {
-			for j := 0; j < len(qkList); j++ {
-				if i == j {
-					continue
-				}
-				if isSubset(qkSlices[i], qkSlices[j]) {
-					isRedundant[i] = true
-					break
-				}
-			}
-		}
-
-		nonRedundantGroups := make(map[string][]string)
-		for idx, qk := range qkList {
-			if !isRedundant[idx] {
-				nonRedundantGroups[qk] = queryGroups[qk]
-			}
-		}
-
-		for qKeys, examples := range nonRedundantGroups {
-			var queryPattern string
-			if qKeys != "" {
-				keys := strings.Split(qKeys, "&")
-				queryParts := make([]string, len(keys))
-				for i, k := range keys {
-					queryParts[i] = regexpEscape(k) + `=([^&]*)`
-				}
-				queryPattern = `\?` + strings.Join(queryParts, "&")
-			}
-
-			fullRegex := pathPattern
-			if queryPattern != "" {
-				fullRegex += queryPattern
-			}
-
-			maxExamples := *examplesFlag
-			if maxExamples < 1 {
-				maxExamples = 1
-			}
-			if len(examples) < maxExamples {
-				maxExamples = len(examples)
-			}
-			patternExamples := examples[:maxExamples]
-
-			patterns = append(patterns, URLPattern{
-				Regex:    fullRegex,
-				Examples: patternExamples,
-			})
-		}
->>>>>>> 40ea5a8be1644f4717c2ddde5065bcf900b38e1c
 	}
 
 	// Gather all unique URLs from the pattern examples.
@@ -292,7 +200,6 @@ func main() {
 	}
 }
 
-<<<<<<< HEAD
 // generateRegexPatterns creates unique regex patterns for a group of URL info.
 // It ensures that the same regex (pattern) is output only once, and if multiple
 // URLs produce the same pattern, their examples are merged (with duplicates removed).
@@ -309,29 +216,6 @@ func generateRegexPatterns(group []urlInfo, examplesFlag int) []URLPattern {
 				break
 			}
 		}
-=======
-func isSubset(a, b []string) bool {
-	setB := make(map[string]struct{})
-	for _, k := range b {
-		setB[k] = struct{}{}
-	}
-	for _, k := range a {
-		if _, ok := setB[k]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// isURLValid checks if a URL returns 200 or 302 without following redirects.
-// It now accepts a timeout parameter.
-func isURLValid(urlStr string, timeout time.Duration) bool {
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
->>>>>>> 40ea5a8be1644f4717c2ddde5065bcf900b38e1c
 	}
 
 	pathPatternParts := make([]string, segmentsCount)
