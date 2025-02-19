@@ -131,7 +131,35 @@ func main() {
 			queryGroups[queryKey] = append(queryGroups[queryKey], info.original)
 		}
 
-		for qKeys, examples := range queryGroups {
+		// Process queryGroups to remove subsets
+		var qkList []string
+		var qkSlices [][]string
+		for qk := range queryGroups {
+			qkList = append(qkList, qk)
+			qkSlices = append(qkSlices, strings.Split(qk, "&"))
+		}
+
+		isRedundant := make([]bool, len(qkList))
+		for i := 0; i < len(qkList); i++ {
+			for j := 0; j < len(qkList); j++ {
+				if i == j {
+					continue
+				}
+				if isSubset(qkSlices[i], qkSlices[j]) {
+					isRedundant[i] = true
+					break
+				}
+			}
+		}
+
+		nonRedundantGroups := make(map[string][]string)
+		for idx, qk := range qkList {
+			if !isRedundant[idx] {
+				nonRedundantGroups[qk] = queryGroups[qk]
+			}
+		}
+
+		for qKeys, examples := range nonRedundantGroups {
 			var queryPattern string
 			if qKeys != "" {
 				keys := strings.Split(qKeys, "&")
@@ -223,6 +251,19 @@ func main() {
 			fmt.Println()
 		}
 	}
+}
+
+func isSubset(a, b []string) bool {
+	setB := make(map[string]struct{})
+	for _, k := range b {
+		setB[k] = struct{}{}
+	}
+	for _, k := range a {
+		if _, ok := setB[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // isURLValid checks if a URL returns 200 or 302 without following redirects.
