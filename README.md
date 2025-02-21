@@ -12,7 +12,7 @@ URLDedup is a command-line tool designed to process a list of URLs, identify pat
 ## Installation
 
 ```sh
-go install github.com/0xQRx/URLDedup/cmd/urldedup@latest
+go install github.com/0xQRx/URLDedup/cmd/urldedup@main
 ```
 
 ## Usage
